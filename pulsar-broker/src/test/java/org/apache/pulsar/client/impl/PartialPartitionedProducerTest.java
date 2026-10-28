@@ -19,15 +19,22 @@
 package org.apache.pulsar.client.impl;
 
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertTrue;
 import java.lang.reflect.Field;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import lombok.Cleanup;
 import lombok.CustomLog;
 import org.apache.pulsar.broker.service.SharedPulsarBaseTest;
+import org.apache.pulsar.client.api.Message;
+import org.apache.pulsar.client.api.MessageId;
+import org.apache.pulsar.client.api.MessageRouter;
 import org.apache.pulsar.client.api.MessageRoutingMode;
+import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.ProducerAccessMode;
+import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.TopicMetadata;
 import org.apache.pulsar.client.impl.customroute.PartialRoundRobinMessageRouterImpl;
 import org.awaitility.Awaitility;
@@ -55,6 +62,39 @@ public class PartialPartitionedProducerTest extends SharedPulsarBaseTest {
             producerImpl.newMessage().value("msg".getBytes()).send();
         }
         assertEquals(producerImpl.getProducers().size(), 1);
+    }
+
+    @Test(timeOut = 60000)
+    public void testLazyStartSendFromSendCallbackDoesNotBlock() throws Throwable {
+        final String topic = newTopicName();
+        admin.topics().createPartitionedTopic(topic, 2);
+
+        // A single IO thread: a send completed on it must not block it
+        final PulsarClient client = PulsarClient.builder()
+                .serviceUrl(getBrokerServiceUrl())
+                .ioThreads(1)
+                .build();
+        try {
+            final Producer<byte[]> producer = client.newProducer()
+                    .topic(topic)
+                    .enableLazyStartPartitionedProducers(true)
+                    .enableBatching(false)
+                    .messageRoutingMode(MessageRoutingMode.CustomPartition)
+                    .messageRouter(new MessageRouter() {
+                        @Override
+                        public int choosePartition(Message<?> msg, TopicMetadata metadata) {
+                            return msg.hasKey() ? Integer.parseInt(msg.getKey()) : 0;
+                        }
+                    })
+                    .create();
+
+            CompletableFuture<MessageId> sends = producer.newMessage().key("0").value("first".getBytes()).sendAsync()
+                    .thenCompose(id -> producer.newMessage().key("1").value("second".getBytes()).sendAsync());
+
+            assertNotNull(sends.get(10, TimeUnit.SECONDS));
+        } finally {
+            client.closeAsync();
+        }
     }
 
     @Test
