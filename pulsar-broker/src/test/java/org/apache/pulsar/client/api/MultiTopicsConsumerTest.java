@@ -49,6 +49,7 @@ import org.apache.logging.log4j.Level;
 import org.apache.pulsar.broker.service.SharedPulsarBaseTest;
 import org.apache.pulsar.client.admin.PulsarAdminException;
 import org.apache.pulsar.client.impl.ClientBuilderImpl;
+import org.apache.pulsar.client.impl.ConsumerBase;
 import org.apache.pulsar.client.impl.ConsumerImpl;
 import org.apache.pulsar.client.impl.MessageIdImpl;
 import org.apache.pulsar.client.impl.MultiTopicsConsumerImpl;
@@ -285,6 +286,41 @@ public class MultiTopicsConsumerTest extends SharedPulsarBaseTest {
     @DataProvider
     public static Object[][] messageIdFromProducer() {
         return new Object[][] { { true }, { false } };
+    }
+
+    @Test
+    public void testSeekOnePartitionKeepsOtherPartitionsMessages() throws Exception {
+        final var topic = TopicName.get(newTopicName()).toString();
+        admin.topics().createPartitionedTopic(topic, 2);
+        final var partition0 = topic + TopicName.PARTITIONED_TOPIC_SUFFIX + 0;
+        final var partition1 = topic + TopicName.PARTITIONED_TOPIC_SUFFIX + 1;
+
+        @Cleanup final var producer0 = pulsarClient.newProducer(Schema.INT32).topic(partition0)
+                .enableBatching(false).create();
+        @Cleanup final var producer1 = pulsarClient.newProducer(Schema.INT32).topic(partition1)
+                .enableBatching(false).create();
+        @Cleanup final var consumer = pulsarClient.newConsumer(Schema.INT32).topic(topic)
+                .subscriptionName("sub")
+                .subscriptionInitialPosition(SubscriptionInitialPosition.Earliest)
+                .subscribe();
+        final var partition0Ids = new ArrayList<MessageId>();
+        for (int i = 0; i < 10; i++) {
+            partition0Ids.add(producer0.send(i));
+            producer1.send(100 + i);
+        }
+        Awaitility.await().until(() -> ((ConsumerBase<?>) consumer).getTotalIncomingMessages() == 20);
+
+        // Seek partition 0 only: the buffered messages of partition 1 must still be delivered
+        consumer.seek(TopicMessageId.create(partition0, partition0Ids.get(0)));
+
+        final var received = new ArrayList<Integer>();
+        Message<Integer> msg;
+        while ((msg = consumer.receive(3, TimeUnit.SECONDS)) != null) {
+            received.add(msg.getValue());
+        }
+        for (int i = 100; i < 110; i++) {
+            assertTrue(received.contains(i), "Missing message " + i + " of partition 1 in " + received);
+        }
     }
 
     @Test(timeOut = 30000, dataProvider = "messageIdFromProducer")
